@@ -1,0 +1,18 @@
+split:
+  validation_ratio: 0.10
+  test_ratio: 0.10
+task_a:
+  model: nvidia/mit-b0
+  epochs: 80
+  batch_size: 8
+  learning_rate: 0.00006
+  input_width: 512
+  input_height: 384
+task_b:
+  seed: 42
+  iterations: 40000
+  downsample: 1.0
+  semantic_loss_weight: 0.5
+  pseudo_mask_weight: 0.5
+  optimize_poses: false
+  semantic_warm_start: true

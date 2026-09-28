@@ -1,0 +1,421 @@
+"""
+Task B: train the Semantic 3D Gaussian Splatting model.
+
+Trains on the 240 train + 30 internal-val trajectory-interleaved labeled images (GT masks, 270
+total - see `src.evaluation.metrics.train_val_test_split`) + the 100 unlabeled images
+(pseudo-masks from Task A, see `src/segmentation/infer.py`) = up to 370 views. The 30 held-out
+*test* labeled images are never used here - reserved entirely for
+`src/evaluation/render_metrics.py`'s final novel-view evaluation, mirroring the organizers'
+blind-test protocol. The 30 internal-val images are folded into Task B's own training pool: they
+only need to stay separate from Task A's own training so Task A's per-epoch checkpoint selection
+isn't validated on data it was trained on, which doesn't apply to Task B (it has no per-epoch
+holdout-based selection step of its own).
+
+Gaussian means/colors are warm-started from `PycolmapReconstructor`'s triangulated sparse cloud,
+and semantic logits from `SemanticProjector`'s per-point voted class - both restricted to the
+270 train+val views (`PycolmapReconstructor(..., exclude_image_names=...)` excludes the 30 test
+images' observations from triangulation itself, so they influence neither point positions nor,
+transitively, the colors sampled from those points' observing images; semantic voting already
+only ever saw train+val masks). The 30 test images never influence even the initialization.
+"""
+import argparse
+import glob
+import os
+import random
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from PIL import Image
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.colmap_io.reconstructor import PycolmapReconstructor, sample_point_colors
+from src.colmap_io.semantic_voting import SemanticProjector
+from src.evaluation.metrics import train_val_test_split
+from src.gaussian_splatting.undistort import undistort_all
+from src.gaussian_splatting.dataset import build_camera_list, GSCamera
+from src.gaussian_splatting.model import SemanticGaussianModel, NUM_CLASSES
+from src.gaussian_splatting.losses import photometric_loss, semantic_ce_loss
+
+from gsplat.strategy import DefaultStrategy
+
+PARAM_LRS = {
+    "means": 1.6e-4,
+    "scales": 5e-3,
+    "quats": 1e-3,
+    "opacities": 5e-2,
+    "colors": 2.5e-3,
+    "sem_logits": 2.5e-3,
+}
+
+
+def _load_labeled_ids(images_dir: str) -> List[str]:
+    ids = []
+    for fname in sorted(os.listdir(images_dir)):
+        stem, ext = os.path.splitext(fname)
+        if ext.lower() == ".png" and stem.isdigit():
+            ids.append(stem)
+    return sorted(ids)
+
+
+def _unlabeled_ids(unlabeled_dir: str) -> List[str]:
+    return sorted(
+        os.path.splitext(os.path.basename(p))[0]
+        for p in glob.glob(os.path.join(unlabeled_dir, "*.png"))
+    )
+
+
+def _camera_center(pose_R: np.ndarray, pose_T: np.ndarray) -> np.ndarray:
+    return -pose_R.T @ pose_T
+
+
+def _compute_scene_scale(cameras: List[GSCamera]) -> float:
+    centers = np.stack([_camera_center(c.R, c.T) for c in cameras])
+    extent = centers.max(axis=0) - centers.min(axis=0)
+    return float(np.linalg.norm(extent) / 2.0 + 1e-6)
+
+
+def _scale_camera(camera: GSCamera, scale: float) -> GSCamera:
+    if scale == 1.0:
+        return camera
+    K = camera.K.copy()
+    K[0, 0] *= scale
+    K[1, 1] *= scale
+    K[0, 2] *= scale
+    K[1, 2] *= scale
+    return GSCamera(
+        image_id=camera.image_id, name=camera.name, K=K, R=camera.R, T=camera.T,
+        width=max(1, int(round(camera.width * scale))), height=max(1, int(round(camera.height * scale))),
+        image_path=camera.image_path, mask_path=camera.mask_path, is_holdout=camera.is_holdout,
+    )
+
+
+def _load_rgb_tensor(path: str, size: Tuple[int, int]) -> torch.Tensor:
+    img = Image.open(path).convert("RGB").resize(size, Image.BILINEAR)
+    return torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0)
+
+
+def _load_mask_tensor(path: str, size: Tuple[int, int]) -> torch.Tensor:
+    m = Image.open(path).resize(size, Image.NEAREST)
+    return torch.from_numpy(np.asarray(m, dtype=np.int64))
+
+
+class _CachedParser:
+    """Adapts an already-loaded (camera, images, pts3d) tuple to `SemanticProjector`'s
+    `parser.load()` contract, so it doesn't silently re-run LO-RANSAC triangulation a second
+    time when we've already loaded the reconstruction once in `prepare_training_data`."""
+
+    def __init__(self, camera, images, pts3d):
+        self._data = (camera, images, pts3d)
+
+    def load(self):
+        return self._data
+
+
+def prepare_training_data(
+    colmap_dir: str,
+    images_dir: str,
+    unlabeled_dir: str,
+    gt_masks_dir: str,
+    pseudo_masks_dir: Optional[str],
+    undistorted_dir: str,
+    val_ratio: float = 0.10,
+    test_ratio: float = 0.10,
+    strict_cable_majority: bool = False,
+):
+    """Loads camera/points/votes, builds the train (labeled+unlabeled) and holdout camera lists.
+    Returns (camera_intrinsics, pts3d, point_classes, point_colors, train_cameras, holdout_cameras,
+    train_ids).
+
+    Uses the same `train_val_test_split` as Task A (`src/segmentation/train.py`), so `holdout_ids`
+    here is exactly Task A's `test_ids` - the one set nothing, anywhere in the pipeline, ever
+    validates or trains on. Task B itself has no per-epoch checkpoint-selection step, so unlike
+    Task A it has no reason to hold `val_ids` back too: they're real GT-labeled views, and Task B
+    folds them into its own training pool (`train_ids` below = Task A's `train_ids + val_ids`).
+    """
+    labeled_ids = _load_labeled_ids(images_dir)
+    _train_ids, _val_ids, holdout_ids = train_val_test_split(labeled_ids, val_ratio, test_ratio)
+    train_ids = _train_ids + _val_ids
+    holdout_set = set(holdout_ids)
+    print(
+        f"[gaussian_splatting] labeled={len(labeled_ids)} "
+        f"train={len(_train_ids)}+val={len(_val_ids)}={len(train_ids)} holdout={len(holdout_ids)}"
+    )
+
+    # Test-split filenames are excluded from triangulation itself (not just from the training
+    # loop below), so the held-out test images influence neither the sparse point cloud's
+    # positions nor - transitively, via sample_point_colors below - the Gaussians' initial
+    # colors. Without this, the geometric/photometric warm-start (though not the loss or the
+    # semantic vote, both already train-only) would have quietly seen the test split.
+    exclude_names = {f"{stem}.png" for stem in holdout_ids}
+    camera, images, pts3d = PycolmapReconstructor(colmap_dir, exclude_image_names=exclude_names).load()
+
+    if not os.path.isdir(undistorted_dir) or not os.listdir(undistorted_dir):
+        print(f"[gaussian_splatting] undistorting images -> {undistorted_dir}")
+        undistort_all([images_dir, unlabeled_dir], camera, undistorted_dir)
+
+    # Vote per-3D-point semantic classes using ONLY the train-split masks (holdout stays
+    # completely untouched, even for this warm-start step): pre-populate the mask cache with
+    # just the train-split GT masks, keyed by path exactly as `SemanticProjector` expects, so
+    # its internal `preload_masks()` fallback (which would load every mask in the directory)
+    # never fires. This step deliberately uses the ORIGINAL (still-distorted) masks, not the
+    # undistorted copies below: a 3D point's 2D observation coordinates come from COLMAP's own
+    # feature tracks, which were detected on these same original, distorted photos - sampling
+    # the undistorted mask at that same (u, v) would silently read the wrong pixel.
+    projector = SemanticProjector(
+        colmap_dir, gt_masks_dir,
+        parser=_CachedParser(camera, images, pts3d),
+    )
+    for stem in train_ids:
+        mask_path = os.path.join(gt_masks_dir, f"{stem}.png")
+        if os.path.exists(mask_path):
+            projector.mask_cache[mask_path] = np.array(Image.open(mask_path), dtype=np.uint8)
+    point_classes, _class_palette_colors = projector.project(strict_cable_majority=strict_cable_majority)
+
+    # Real per-point RGB, sampled from the original photos at each point's own projected pixel -
+    # NOT `_class_palette_colors` above, which is a lookup from voted class to a fixed swatch
+    # (the same palette used to color the semantic figures) and carries no actual appearance
+    # information. `pts3d[i].image_ids` already excludes the 30 test images (triangulation above
+    # was called with `exclude_image_names`), so this transitively excludes them too - it samples
+    # from every image that's actually allowed to influence the model, train+val+unlabeled alike.
+    point_colors = sample_point_colors(pts3d, images, [images_dir, unlabeled_dir])
+
+    # Every mask paired with a `GSCamera` below, by contrast, must be undistorted: its
+    # `image_path` points at the undistorted image cache and its `K` is the pinhole intrinsic
+    # matrix, so a still-distorted mask would be systematically misaligned with what the model
+    # actually renders (up to ~6px at this camera's k1, worse right where classes are thin) -
+    # corrupting both the training semantic loss and the holdout evaluation. GT masks and Task
+    # A's pseudo-masks are both rasterized/predicted on the original distorted photos, so both
+    # need the same one-time remap as the images, cached the same lazy way.
+    undistorted_gt_masks_dir = os.path.join(os.path.dirname(undistorted_dir), "undistorted_gt_masks")
+    if not os.path.isdir(undistorted_gt_masks_dir) or not os.listdir(undistorted_gt_masks_dir):
+        print(f"[gaussian_splatting] undistorting GT masks -> {undistorted_gt_masks_dir}")
+        undistort_all([gt_masks_dir], camera, undistorted_gt_masks_dir, is_mask=True)
+
+    # `mask_lookup` covers train (GT), holdout (GT - eval-only, never used by `train_cameras`
+    # since those are additionally filtered on `not is_holdout`) and pseudo-labeled unlabeled ids.
+    mask_lookup: Dict[str, str] = {
+        stem: os.path.join(undistorted_gt_masks_dir, f"{stem}.png")
+        for stem in list(train_ids) + list(holdout_ids)
+    }
+    if pseudo_masks_dir and os.path.isdir(pseudo_masks_dir):
+        undistorted_pseudo_masks_dir = os.path.join(
+            os.path.dirname(undistorted_dir), "undistorted_pseudo_masks"
+        )
+        if not os.path.isdir(undistorted_pseudo_masks_dir) or not os.listdir(undistorted_pseudo_masks_dir):
+            print(f"[gaussian_splatting] undistorting pseudo-masks -> {undistorted_pseudo_masks_dir}")
+            undistort_all([pseudo_masks_dir], camera, undistorted_pseudo_masks_dir, is_mask=True)
+        for stem in _unlabeled_ids(unlabeled_dir):
+            pseudo_path = os.path.join(undistorted_pseudo_masks_dir, f"{stem}.png")
+            if os.path.exists(pseudo_path):
+                mask_lookup[stem] = pseudo_path
+
+    all_cameras = build_camera_list(camera, images, undistorted_dir, mask_lookup, holdout_set)
+    train_cameras = [c for c in all_cameras if not c.is_holdout and c.mask_path is not None]
+    holdout_cameras = [c for c in all_cameras if c.is_holdout]
+
+    return camera, pts3d, point_classes, point_colors, train_cameras, holdout_cameras, set(train_ids)
+
+
+def train(
+    colmap_dir: str,
+    images_dir: str,
+    unlabeled_dir: str,
+    gt_masks_dir: str,
+    pseudo_masks_dir: Optional[str],
+    undistorted_dir: str,
+    output_dir: str,
+    val_ratio: float = 0.10,
+    test_ratio: float = 0.10,
+    iters: int = 20000,
+    downsample: float = 0.5,
+    lambda_sem: float = 0.5,
+    pseudo_mask_weight: float = 0.5,
+    max_gaussians: int = 600_000,
+    log_every: int = 100,
+    ckpt_every: int = 2000,
+    device: str = None,
+    seed: int = 42,
+    optimize_poses: bool = False,
+    pose_lr: float = 1e-3,
+    strict_cable_majority: bool = False,
+    warm_start_semantics: bool = True,
+):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(output_dir, exist_ok=True)
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    camera_intr, pts3d, point_classes, point_colors, train_cameras, holdout_cameras, train_ids = prepare_training_data(
+        colmap_dir, images_dir, unlabeled_dir, gt_masks_dir, pseudo_masks_dir, undistorted_dir,
+        val_ratio, test_ratio, strict_cable_majority=strict_cable_majority,
+    )
+    print(f"[gaussian_splatting] train views={len(train_cameras)} holdout views={len(holdout_cameras)}")
+
+    model = SemanticGaussianModel.init_from_sparse(
+        pts3d, point_classes, point_colors, device=device, warm_start_semantics=warm_start_semantics
+    )
+    print(f"[gaussian_splatting] initial Gaussians: {model.num_points}")
+
+    optimizers = {k: torch.optim.Adam([v], lr=PARAM_LRS[k], eps=1e-15) for k, v in model.params.items()}
+    means_lr_init, means_lr_final = PARAM_LRS["means"], PARAM_LRS["means"] * 0.01
+
+    # Optional per-image learnable pose correction (R' = dR @ R, T' = T + dT), jointly optimized
+    # with the Gaussians - refines the reference SfM poses (README: "reference only, not
+    # ground-truth") instead of trusting them as fixed. Held-out/blind-test rendering never uses
+    # these, since there is no way to "correct" a pose that was never observed during training.
+    pose_deltas: Dict[str, Dict[str, torch.nn.Parameter]] = {}
+    pose_optimizer = None
+    if optimize_poses:
+        for cam in train_cameras:
+            pose_deltas[cam.name] = {
+                "quat": torch.nn.Parameter(torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)),
+                "trans": torch.nn.Parameter(torch.zeros(3, device=device)),
+            }
+        pose_params = [p for d in pose_deltas.values() for p in d.values()]
+        pose_optimizer = torch.optim.Adam(pose_params, lr=pose_lr, weight_decay=1e-2)
+        print(f"[gaussian_splatting] pose optimization enabled for {len(pose_deltas)} train views")
+
+    scene_scale = _compute_scene_scale(train_cameras)
+    strategy = DefaultStrategy(
+        refine_start_iter=500,
+        refine_stop_iter=min(15000, int(iters * 0.75)),
+        refine_every=100,
+        reset_every=3000,
+        verbose=False,
+    )
+    strategy.check_sanity(model.params, optimizers)
+    state = strategy.initialize_state(scene_scale=scene_scale)
+
+    # Preload (downsampled) train images/masks into memory once - avoids repeated disk I/O.
+    cache: Dict[str, Tuple[torch.Tensor, torch.Tensor, GSCamera, float]] = {}
+    for cam in train_cameras:
+        scaled_cam = _scale_camera(cam, downsample)
+        size = (scaled_cam.width, scaled_cam.height)
+        rgb = _load_rgb_tensor(cam.image_path, size)
+        mask = _load_mask_tensor(cam.mask_path, size)
+        weight = 1.0 if cam.name.split(".")[0] in train_ids else pseudo_mask_weight
+        cache[cam.name] = (rgb, mask, scaled_cam, weight)
+
+    order = list(cache.keys())
+    t0 = time.time()
+    for step in range(1, iters + 1):
+        if step % len(order) == 1:
+            random.shuffle(order)
+        name = order[(step - 1) % len(order)]
+        rgb_target, mask_target, cam, sem_weight = cache[name]
+        rgb_target = rgb_target.to(device)
+        mask_target = mask_target.to(device)
+
+        for g in optimizers["means"].param_groups:
+            frac = min(1.0, step / max(1, iters))
+            g["lr"] = means_lr_init * (means_lr_final / means_lr_init) ** frac
+
+        delta = pose_deltas.get(name)
+        pose_kwargs = {"pose_delta_quat": delta["quat"], "pose_delta_trans": delta["trans"]} if delta else {}
+        out, _alpha, meta = model.render_full(cam, packed=True, **pose_kwargs)
+        strategy.step_pre_backward(model.params, optimizers, state, step, meta)
+
+        out0 = out[0]
+        rgb_pred = out0[..., :3].clamp(0.0, 1.0)
+        sem_pred = out0[..., 3:]
+
+        loss = photometric_loss(rgb_pred, rgb_target) + lambda_sem * sem_weight * semantic_ce_loss(sem_pred, mask_target)
+        loss.backward()
+
+        if model.num_points < max_gaussians:
+            strategy.step_post_backward(model.params, optimizers, state, step, meta, packed=True)
+        for opt in optimizers.values():
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        if pose_optimizer is not None:
+            pose_optimizer.step()
+            pose_optimizer.zero_grad(set_to_none=True)
+
+        if step % log_every == 0:
+            elapsed = time.time() - t0
+            print(f"[gaussian_splatting] step {step}/{iters} loss={loss.item():.4f} "
+                  f"n_gaussians={model.num_points} ({elapsed:.1f}s)")
+
+        if step % ckpt_every == 0 or step == iters:
+            ckpt_path = os.path.join(output_dir, f"step_{step}.pt")
+            torch.save({"params": model.state_dict(), "step": step}, ckpt_path)
+
+    if pose_deltas:
+        with torch.no_grad():
+            trans_norms = torch.stack([d["trans"].norm() for d in pose_deltas.values()])
+            angle_deg = torch.stack(
+                [2 * torch.acos(torch.clamp(torch.nn.functional.normalize(d["quat"], dim=-1)[0], -1, 1))
+                 * 180.0 / np.pi for d in pose_deltas.values()]
+            )
+        print(f"[gaussian_splatting] pose correction: mean |dT|={trans_norms.mean().item():.4f} "
+              f"(max {trans_norms.max().item():.4f}), mean |dR|={angle_deg.mean().item():.3f}deg "
+              f"(max {angle_deg.max().item():.3f}deg)")
+
+    final_path = os.path.join(output_dir, "final.pt")
+    torch.save({"params": model.state_dict(), "step": iters}, final_path)
+    print(f"[gaussian_splatting] training complete -> {final_path}")
+    return model, final_path, holdout_cameras
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Task B: train the Semantic 3D Gaussian Splatting model")
+    parser.add_argument("--colmap-dir", default=None)
+    parser.add_argument("--images-dir", default=None)
+    parser.add_argument("--unlabeled-dir", default=None)
+    parser.add_argument("--gt-masks-dir", default=None)
+    parser.add_argument("--pseudo-masks-dir", default=None)
+    parser.add_argument("--undistorted-dir", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--val-ratio", type=float, default=0.10,
+                         help="Fraction reserved for Task A's internal validation split - folded "
+                              "into Task B's own training pool, since only Task A does "
+                              "holdout-based checkpoint selection")
+    parser.add_argument("--test-ratio", type=float, default=0.10,
+                         help="Fraction reserved as the final, never-touched evaluation holdout "
+                              "(same set Task A's own training excludes from validation too)")
+    parser.add_argument("--iters", type=int, default=20000)
+    parser.add_argument("--downsample", type=float, default=0.5)
+    parser.add_argument("--lambda-sem", type=float, default=0.5)
+    parser.add_argument("--optimize-poses", action="store_true",
+                         help="Jointly refine the reference SfM train-view poses alongside the Gaussians")
+    parser.add_argument("--pose-lr", type=float, default=1e-3)
+    parser.add_argument("--strict-cable-majority", action="store_true",
+                         help="Tested-but-not-adopted alternative: require an absolute majority "
+                              "for the cable class specifically, instead of the default plain "
+                              "plurality used for every class")
+    parser.add_argument("--no-semantic-warmstart", action="store_true",
+                         help="Ablation: initialize semantic logits to a neutral zero vector "
+                              "instead of warm-starting from the voted class")
+    parser.add_argument("--seed", type=int, default=42,
+                         help="Random seed for view-order shuffling and densification "
+                              "stochasticity - vary this to measure run-to-run noise for a "
+                              "fixed configuration")
+    args = parser.parse_args()
+
+    dataset_dir = os.getenv("CONTEST_DATASET_DIR", os.path.join(PROJECT_ROOT, "data", "Contest Dataset"))
+    colmap_dir = args.colmap_dir or os.path.join(dataset_dir, "camera_parameters")
+    images_dir = args.images_dir or os.path.join(dataset_dir, "images")
+    unlabeled_dir = args.unlabeled_dir or os.path.join(dataset_dir, "unlabeled_Images")
+    gt_masks_dir = args.gt_masks_dir or os.path.join(PROJECT_ROOT, "outputs", "gt_masks")
+    pseudo_masks_dir = args.pseudo_masks_dir or os.path.join(PROJECT_ROOT, "outputs", "pseudo_masks")
+    undistorted_dir = args.undistorted_dir or os.path.join(PROJECT_ROOT, "outputs", "undistorted_images")
+    output_dir = args.output_dir or os.path.join(PROJECT_ROOT, "outputs", "checkpoints", "gaussians")
+
+    train(
+        colmap_dir, images_dir, unlabeled_dir, gt_masks_dir, pseudo_masks_dir, undistorted_dir, output_dir,
+        val_ratio=args.val_ratio, test_ratio=args.test_ratio, iters=args.iters, downsample=args.downsample, lambda_sem=args.lambda_sem,
+        optimize_poses=args.optimize_poses, pose_lr=args.pose_lr,
+        strict_cable_majority=args.strict_cable_majority,
+        warm_start_semantics=not args.no_semantic_warmstart,
+        seed=args.seed,
+    )
+
+
+if __name__ == "__main__":
+    main()
